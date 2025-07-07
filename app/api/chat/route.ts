@@ -1,63 +1,123 @@
-import { streamText } from "ai"
-import { createOpenAI } from "@ai-sdk/openai"
-
-const openai = createOpenAI({
-  apiKey: process.env.OPENROUTER_API_KEY,
-  baseURL: "https://openrouter.ai/api/v1",
-})
+import { type NextRequest, NextResponse } from "next/server"
 
 export const maxDuration = 30
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
     const { messages, scanData } = await req.json()
 
-    const systemPrompt = `You are DhaViPa, an AI cybersecurity expert specializing in vulnerability analysis and network security. You help users understand security scan results, explain vulnerabilities, and provide actionable security recommendations.
+    if (!messages || !Array.isArray(messages)) {
+      return NextResponse.json({ error: "Invalid messages format" }, { status: 400 })
+    }
 
-IMPORTANT IDENTITY RESPONSES:
-If anyone asks about your name, identity, or who you are (like "What is your name?", "What's your full name?", "Who are you?", "Tell me your name"), respond with:
-"My name is DhaViPa — short for Dynamic Host & Vulnerability Intelligence Partner. I'm your assistant for analyzing IPs, detecting vulnerabilities, and explaining security data in simple terms."
+    // Shorter, more focused system prompt for faster processing
+    const systemPrompt = `You are DhaViPa (Dynamic Host & Vulnerability Intelligence Partner), an AI cybersecurity expert.
 
-If anyone asks about your developer, creator, or who built/made you, respond with:
-"I was developed by Ronit Paikray — a passionate developer, cybersecurity enthusiast, and creator of The Desi Digital Defender."
-
-If someone asks for more details about your developer or about Ronit Paikray, respond with:
-"Ronit Paikray is a cybersecurity researcher, ethical hacker, and developer. He's the founder of The Desi Digital Defender and also works on advanced tools and AI-powered systems in the field of cybersecurity."
+IDENTITY: If asked about your name/identity: "I'm DhaViPa, your cybersecurity assistant."
+CREATOR: If asked about your developer: "I was created by Ronit Paikray, cybersecurity researcher and founder of The Desi Digital Defender."
 
 ${
   scanData
-    ? `Current scan data for analysis:
-IP: ${scanData.ip}
-Open Ports: ${scanData.ports?.join(", ") || "None"}
-Vulnerabilities: ${scanData.vulns?.join(", ") || "None detected"}
-CPEs: ${scanData.cpes?.join(", ") || "None"}
-Hostnames: ${scanData.hostnames?.join(", ") || "None"}
-Tags: ${scanData.tags?.join(", ") || "None"}
-Risk Level: ${scanData.riskLevel}
+    ? `SCAN DATA - ${scanData.ip}:
+Ports: ${scanData.ports?.slice(0, 10).join(", ") || "None"}${scanData.ports?.length > 10 ? "..." : ""}
+Vulns: ${scanData.vulns?.slice(0, 5).join(", ") || "None"}${scanData.vulns?.length > 5 ? "..." : ""}
+Risk: ${scanData.riskLevel}
 
-Use this data to provide specific, actionable security advice.`
+Provide concise, actionable security advice.`
     : ""
 }
 
-Guidelines:
-- Always check if the user is asking about your identity or developer first
-- Provide clear, actionable security recommendations
-- Explain technical terms in an accessible way
-- Focus on practical risk mitigation
-- Be concise but thorough
-- Use emojis sparingly for better readability
-- Always prioritize security best practices`
+Be concise, clear, and security-focused.`
 
-    const result = streamText({
-      model: openai("deepseek/deepseek-r1-0528:free"),
-      messages: [{ role: "system", content: systemPrompt }, ...messages],
-      temperature: 0.7,
-      maxTokens: 1000,
+    // Convert messages to OpenRouter format
+    const openRouterMessages = [
+      {
+        role: "system",
+        content: systemPrompt,
+      },
+      ...messages.slice(-6).map((msg: any) => {
+        // Only keep last 6 messages for faster processing
+        let content = ""
+
+        if (typeof msg.content === "string") {
+          content = msg.content
+        } else if (msg.parts && Array.isArray(msg.parts)) {
+          content = msg.parts
+            .filter((part: any) => part.type === "text")
+            .map((part: any) => part.text)
+            .join("")
+        }
+
+        return {
+          role: msg.role,
+          content: content.slice(0, 500), // Limit message length for faster processing
+        }
+      }),
+    ]
+
+    console.log("Sending request to OpenRouter with messages:", openRouterMessages.length)
+
+    // Call OpenRouter API with optimized settings
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer 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",
+        "HTTP-Referer": "https://dhavipa.netlify.app",
+        "X-Title": "DhaViPa",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "mistralai/mistral-7b-instruct:free", // fast model available on OpenRouter
+        messages: openRouterMessages,
+        temperature: 0.3, // Lower for faster, more focused responses
+        max_tokens: 400, // Reduced for faster responses
+        top_p: 0.9, // Optimize sampling
+        frequency_penalty: 0.1,
+        presence_penalty: 0.1,
+        stream: false,
+      }),
     })
 
-    return result.toDataStreamResponse()
+    // Read body as text first
+    const raw = await response.text()
+
+    if (!response.ok) {
+      console.error("OpenRouter API error:", response.status, raw)
+      return NextResponse.json(
+        { error: `OpenRouter error ${response.status}: ${raw || response.statusText}` },
+        { status: response.status },
+      )
+    }
+
+    let data: any
+    try {
+      data = JSON.parse(raw)
+    } catch {
+      console.error("Non-JSON response from OpenRouter:", raw)
+      return NextResponse.json({ error: "Received invalid JSON from AI service" }, { status: 502 })
+    }
+
+    if (!data.choices?.[0]?.message?.content) {
+      console.error("Unexpected JSON structure:", data)
+      return NextResponse.json({ error: "Malformed response from AI service" }, { status: 502 })
+    }
+
+    const aiResponse = data.choices[0].message.content
+
+    if (!aiResponse) {
+      console.error("Empty response from OpenRouter")
+      return NextResponse.json({ error: "Empty response from AI service" }, { status: 500 })
+    }
+
+    // Return response in the format expected by useChat hook
+    return NextResponse.json({
+      id: `msg-${Date.now()}`,
+      role: "assistant",
+      content: aiResponse,
+      parts: [{ type: "text", text: aiResponse }],
+    })
   } catch (error) {
     console.error("Chat API error:", error)
-    return new Response("Internal Server Error", { status: 500 })
+    return NextResponse.json({ error: "Internal server error. Please try again." }, { status: 500 })
   }
 }

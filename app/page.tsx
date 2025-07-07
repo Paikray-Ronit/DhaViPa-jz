@@ -1,7 +1,8 @@
 "use client"
 
-import { useState } from "react"
-import { useChat } from "@ai-sdk/react"
+import type React from "react"
+
+import { useState, useCallback, useMemo } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -9,7 +10,7 @@ import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Download, Shield, Search, MessageCircle, Globe, AlertTriangle } from "lucide-react"
+import { Download, Shield, Search, MessageCircle, Globe, AlertTriangle, Send, Loader2 } from "lucide-react"
 
 interface ScanResult {
   ip: string
@@ -22,6 +23,13 @@ interface ScanResult {
   riskLevel: "Low" | "Medium" | "High" | "Critical"
 }
 
+interface ChatMessage {
+  id: string
+  role: "user" | "assistant"
+  content: string
+  parts?: { type: string; text: string }[]
+}
+
 export default function DhaViPa() {
   const [target, setTarget] = useState("")
   const [scanResult, setScanResult] = useState<ScanResult | null>(null)
@@ -30,12 +38,28 @@ export default function DhaViPa() {
   const [showChat, setShowChat] = useState(false)
   const [showDetailedVulns, setShowDetailedVulns] = useState(false)
 
-  const { messages, input, handleInputChange, handleSubmit, isLoading } = useChat({
-    api: "/api/chat",
-    body: {
-      scanData: scanResult,
-    },
-  })
+  // Chat state
+  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [input, setInput] = useState("")
+  const [isLoading, setIsLoading] = useState(false)
+
+  // Memoized risk color function for better performance
+  const getRiskColor = useMemo(() => {
+    return (risk: string) => {
+      switch (risk) {
+        case "Low":
+          return "bg-green-100 text-green-800"
+        case "Medium":
+          return "bg-yellow-100 text-yellow-800"
+        case "High":
+          return "bg-orange-100 text-orange-800"
+        case "Critical":
+          return "bg-red-100 text-red-800"
+        default:
+          return "bg-gray-100 text-gray-800"
+      }
+    }
+  }, [])
 
   const handleScan = async () => {
     if (!target.trim()) return
@@ -44,6 +68,7 @@ export default function DhaViPa() {
     setError("")
     setScanResult(null)
     setShowChat(false)
+    setMessages([]) // Clear previous chat
 
     try {
       const response = await fetch("/api/scan", {
@@ -65,6 +90,65 @@ export default function DhaViPa() {
       setIsScanning(false)
     }
   }
+
+  // Optimized chat submit with debouncing
+  const handleChatSubmit = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault()
+      if (!input.trim() || isLoading) return
+
+      const userMessage: ChatMessage = {
+        id: `user-${Date.now()}`,
+        role: "user",
+        content: input.trim(),
+        parts: [{ type: "text", text: input.trim() }],
+      }
+
+      const newMessages = [...messages, userMessage]
+      setMessages(newMessages)
+      setInput("")
+      setIsLoading(true)
+
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: newMessages.slice(-6), // Only send last 6 messages for faster processing
+            scanData: scanResult,
+          }),
+        })
+
+        if (!response.ok) {
+          const errorData = await response.json()
+          throw new Error(errorData.error || "Failed to get response")
+        }
+
+        const aiResponse = await response.json()
+
+        const assistantMessage: ChatMessage = {
+          id: aiResponse.id || `assistant-${Date.now()}`,
+          role: "assistant",
+          content: aiResponse.content,
+          parts: aiResponse.parts || [{ type: "text", text: aiResponse.content }],
+        }
+
+        setMessages([...newMessages, assistantMessage])
+      } catch (err) {
+        console.error("Chat error:", err)
+        const errorMessage: ChatMessage = {
+          id: `error-${Date.now()}`,
+          role: "assistant",
+          content: "Sorry, I'm having trouble responding right now. Please try again.",
+          parts: [{ type: "text", text: "Sorry, I'm having trouble responding right now. Please try again." }],
+        }
+        setMessages([...newMessages, errorMessage])
+      } finally {
+        setIsLoading(false)
+      }
+    },
+    [input, isLoading, messages, scanResult],
+  )
 
   const handleDownload = async (format: "json" | "txt") => {
     if (!scanResult) return
@@ -89,21 +173,6 @@ export default function DhaViPa() {
       URL.revokeObjectURL(url)
     } catch (err) {
       console.error("Download failed:", err)
-    }
-  }
-
-  const getRiskColor = (risk: string) => {
-    switch (risk) {
-      case "Low":
-        return "bg-green-100 text-green-800"
-      case "Medium":
-        return "bg-yellow-100 text-yellow-800"
-      case "High":
-        return "bg-orange-100 text-orange-800"
-      case "Critical":
-        return "bg-red-100 text-red-800"
-      default:
-        return "bg-gray-100 text-gray-800"
     }
   }
 
@@ -179,7 +248,14 @@ export default function DhaViPa() {
                 className="flex-1"
               />
               <Button onClick={handleScan} disabled={isScanning || !target.trim()} className="min-w-[120px]">
-                {isScanning ? "Scanning..." : "Scan Target"}
+                {isScanning ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Scanning...
+                  </>
+                ) : (
+                  "Scan Target"
+                )}
               </Button>
             </div>
             {error && (
@@ -344,13 +420,14 @@ export default function DhaViPa() {
               </CardContent>
             </Card>
 
-            {/* AI Chat Interface - keep existing code */}
+            {/* AI Chat Interface */}
             {showChat && (
               <Card>
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <MessageCircle className="h-5 w-5" />
                     AI Analysis Chat
+                    {isLoading && <Loader2 className="h-4 w-4 animate-spin text-blue-500" />}
                   </CardTitle>
                   <CardDescription>
                     Ask me questions about the scan results, vulnerabilities, or security recommendations
@@ -377,35 +454,31 @@ export default function DhaViPa() {
                           <div className="font-semibold text-sm mb-1">
                             {message.role === "user" ? "You" : "DhaViPa AI"}
                           </div>
-                          <div className="text-sm whitespace-pre-wrap">
-                            {message.parts.map((part, i) => {
-                              if (part.type === "text") {
-                                return <span key={i}>{part.text}</span>
-                              }
-                              return null
-                            })}
-                          </div>
+                          <div className="text-sm whitespace-pre-wrap">{message.content}</div>
                         </div>
                       </div>
                     ))}
                     {isLoading && (
                       <div className="bg-gray-100 mr-8 p-3 rounded-lg">
-                        <div className="font-semibold text-sm mb-1">DhaViPa AI</div>
-                        <div className="text-sm">Analyzing...</div>
+                        <div className="font-semibold text-sm mb-1 flex items-center gap-2">
+                          DhaViPa AI
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        </div>
+                        <div className="text-sm">Analyzing security data...</div>
                       </div>
                     )}
                   </ScrollArea>
 
-                  <form onSubmit={handleSubmit} className="flex gap-2">
+                  <form onSubmit={handleChatSubmit} className="flex gap-2">
                     <Input
                       value={input}
-                      onChange={handleInputChange}
+                      onChange={(e) => setInput(e.target.value)}
                       placeholder="Ask about vulnerabilities, risks, or recommendations..."
                       disabled={isLoading}
                       className="flex-1"
                     />
-                    <Button type="submit" disabled={isLoading || !input.trim()}>
-                      Send
+                    <Button type="submit" disabled={isLoading || !input.trim()} size="icon">
+                      {isLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
                     </Button>
                   </form>
                 </CardContent>
